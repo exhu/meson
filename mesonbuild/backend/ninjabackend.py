@@ -275,11 +275,11 @@ class NinjaRule:
             outfile.write('\n')
 
     def _length_estimate(self, infiles: str, outfiles: str,
-                         elems: T.List[T.Tuple[str, T.List[str]]]) -> int:
+                         elems: T.Dict[str, T.List[str]]) -> int:
         # determine variables
         # this order of actions only approximates ninja's scoping rules, as
         # documented at: https://ninja-build.org/manual.html#ref_scope
-        ninja_vars = dict(elems)
+        ninja_vars = elems.copy()
         if self.deps is not None:
             ninja_vars['deps'] = [self.deps]
         if self.depfile is not None:
@@ -314,8 +314,7 @@ class NinjaRule:
                                      element.elems) >= rsp_threshold
 
 class NinjaBuildElement:
-
-    rule: NinjaRule
+    rule: mesonlib.late_property[NinjaRule] = mesonlib.late_property()
 
     def __init__(self, all_outputs: T.Set[str], outfilenames: ListifiedStr, rulename: str, infilenames: ListifiedStr, implicit_outs: T.Optional[T.List[str]] = None):
         self.implicit_outfilenames = implicit_outs or []
@@ -331,7 +330,7 @@ class NinjaBuildElement:
             self.infilenames = infilenames
         self.deps: T.Set[str] = set()
         self.orderdeps: T.Set[str] = set()
-        self.elems: T.List[T.Tuple[str, T.List[str]]] = []
+        self.elems: T.Dict[str, T.List[str]] = {}
         self.all_outputs = all_outputs
         self.output_errors = ''
 
@@ -348,16 +347,21 @@ class NinjaBuildElement:
             self.orderdeps.add(dep)
 
     def add_item(self, name: str, elems: T.Union[ListifiedStr, CompilerArgs]) -> None:
+        if name in self.elems:
+            raise MesonBugException(f'Item {name!r} added to a NinjaBuildElement more than once')
         # Always convert from GCC-style argument naming to the naming used by the
         # current compiler. Also filter system include paths, deduplicate, etc.
         if isinstance(elems, CompilerArgs):
             elems = elems.to_native()
         if isinstance(elems, str):
             elems = [elems]
-        self.elems.append((name, elems))
+        self.elems[name] = elems
 
         if name == 'DEPFILE':
-            self.elems.append((name + '_UNQUOTED', elems))
+            self.elems[name + '_UNQUOTED'] = elems
+
+    def remove_item(self, name: str) -> None:
+        del self.elems[name]
 
     @mesonlib.lazy_property
     def _should_use_rspfile(self) -> bool:
@@ -421,8 +425,7 @@ class NinjaBuildElement:
         else:
             qf = quote_func
 
-        for e in self.elems:
-            (name, elems) = e
+        for name, elems in self.elems.items():
             should_quote = name not in raw_names
             line = f' {name} = '
             newelems = []
@@ -3390,7 +3393,12 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
                     result += c
                 return result
             element.add_item('CUDA_ESCAPED_TARGET', quote_make_target(rel_obj))
+        element.add_item('ARGS', commands)
+
+        # NinjaRule.should_use_rspfile counts element.elems too, which will
+        # exceed the RSP threshold only after added
         if self.ninja.should_use_rspfile(element) and compiler.rsp_file_syntax() == RSPFileSyntax.NASM:
+            element.remove_item('ARGS')
             exe = compiler.get_exelist()
             # Add to commands the args created by generate_compile_rule_for().
             # commands remain separate from exelist because they must stay
@@ -3409,8 +3417,6 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
             cmd_type = f' (wrapped by meson {reason})' if reason else ''
             element.add_item('COMMAND', meson_exe_cmd)
             element.add_item('description', f'Compiling {compiler.get_display_language()} object {rel_obj}{cmd_type}')
-        else:
-            element.add_item('ARGS', commands)
 
         self.add_dependency_scanner_entries_to_element(target, compiler, element, src)
         self.add_build(element)
